@@ -1,0 +1,12 @@
+Earth 3D model
+Source: https://github.com/Lolpagal7/radiantwars/blob/main/public/earth.glb
+The model is loaded using the component structure from src/solarSystem/earth.jsx in the same repository.
+
+Moon 3D model
+Source: User-provided /home/lolpagal/Downloads/moon.glb
+
+Himalaya terrain reference (embedded, not redistributed)
+Model: JAEN-EVEREST_FOR_DIGITAL
+Creator: bjarque
+Source: https://sketchfab.com/3d-models/jaen-everest-for-digital-cdfadbbb25794f51a9d35275b7cfd8c1
+Embed: https://sketchfab.com/models/cdfadbbb25794f51a9d35275b7cfd8c1/embed
