@@ -147,32 +147,33 @@ class HazardPropagator4D:
     def _identify_river_channel(self, dem: np.ndarray) -> np.ndarray:
         """Identify main river channel as lowest elevation path"""
         n = dem.shape[0]
-        # Flow accumulation approximation: count upstream cells
-        dzdx, dzdy = np.gradient(dem, self.engine.cell_size)
-
-        # Flow direction (steepest descent)
-        flow_dir = np.arctan2(-dzdy, -dzdx)  # Direction water flows
-
-        # Simple flow accumulation using D8 approximation
+        # Vectorized D8 flow accumulation. The prior nested Python loops ran
+        # once per cell for each new rainfall setting.
         flow_acc = np.ones_like(dem)
-        for _ in range(3):  # Iterate to propagate
-            new_acc = flow_acc.copy()
-            for i in range(1, n-1):
-                for j in range(1, n-1):
-                    # Find steepest neighbor
-                    neighbors = []
-                    for di, dj in [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]:
-                        ni, nj = i+di, j+dj
-                        drop = dem[i,j] - dem[ni,nj]
-                        if drop > 0:
-                            neighbors.append((drop, ni, nj))
-                    if neighbors:
-                        _, ni, nj = max(neighbors, key=lambda x: x[0])
-                        new_acc[ni, nj] += flow_acc[i, j] * 0.1
-            flow_acc = new_acc
+        yy, xx = np.indices((n, n))
+        best_drop = np.zeros_like(dem)
+        downstream = np.arange(n * n, dtype=np.int32).reshape(n, n)
+        for di, dj in ((-1, -1), (-1, 0), (-1, 1), (0, -1),
+                       (0, 1), (1, -1), (1, 0), (1, 1)):
+            neighbor = np.roll(np.roll(dem, -di, axis=0), -dj, axis=1)
+            valid = (yy + di >= 0) & (yy + di < n) & (xx + dj >= 0) & (xx + dj < n)
+            drop = np.where(valid, dem - neighbor, 0.0)
+            choose = drop > best_drop
+            best_drop[choose] = drop[choose]
+            downstream[choose] = ((yy + di) * n + (xx + dj))[choose]
+
+        flowing = best_drop > 0
+        for _ in range(3):
+            additions = np.bincount(
+                downstream[flowing].ravel(),
+                weights=flow_acc[flowing].ravel() * 0.1,
+                minlength=n * n,
+            ).reshape(n, n)
+            flow_acc += additions
 
         # River = high flow accumulation + low elevation
-        river_thresh = np.percentile(flow_acc[flow_acc > 1], 95)
+        contributing = flow_acc[flow_acc > 1]
+        river_thresh = np.percentile(contributing, 95) if contributing.size else np.inf
         river_mask = (flow_acc > river_thresh) & (dem < np.percentile(dem, 30))
 
         return river_mask.astype(np.float32)
@@ -180,55 +181,34 @@ class HazardPropagator4D:
     def _identify_bridges(self, dem: np.ndarray, river_mask: np.ndarray) -> np.ndarray:
         """Identify likely bridge locations (road crossings over river)"""
         n = dem.shape[0]
-        # Road corridor (from terrain engine) - approximate as relatively flat path crossing river
-        # Find local minima in elevation along perpendicular to river
-        bridge_mask = np.zeros_like(dem)
-
         # Simple heuristic: cells where river crosses a "ridge" in transverse direction
         dzdx, dzdy = np.gradient(dem, self.engine.cell_size)
-
-        for i in range(2, n-2):
-            for j in range(2, n-2):
-                if river_mask[i, j] > 0.5:
-                    # Check if this is a crossing (higher ground on both sides perpendicular to flow)
-                    flow_angle = np.arctan2(-dzdy[i,j], -dzdx[i,j])
-                    perp_angle = flow_angle + np.pi/2
-                    di = int(np.round(np.sin(perp_angle)))
-                    dj = int(np.round(np.cos(perp_angle)))
-                    if (0 <= i+di < n and 0 <= i-di < n and
-                        0 <= j+dj < n and 0 <= j-dj < n):
-                        if dem[i+di, j+dj] > dem[i,j] + 5 and dem[i-di, j-dj] > dem[i,j] + 5:
-                            bridge_mask[i, j] = 1.0
-
-        return bridge_mask
+        flow_angle = np.arctan2(-dzdy, -dzdx)
+        perp_angle = flow_angle + np.pi / 2
+        di = np.rint(np.sin(perp_angle)).astype(np.int32)
+        dj = np.rint(np.cos(perp_angle)).astype(np.int32)
+        yy, xx = np.indices((n, n))
+        plus_y, minus_y = yy + di, yy - di
+        plus_x, minus_x = xx + dj, xx - dj
+        valid = ((plus_y >= 0) & (plus_y < n) & (minus_y >= 0) & (minus_y < n) &
+                 (plus_x >= 0) & (plus_x < n) & (minus_x >= 0) & (minus_x < n))
+        plus = dem[np.clip(plus_y, 0, n - 1), np.clip(plus_x, 0, n - 1)]
+        minus = dem[np.clip(minus_y, 0, n - 1), np.clip(minus_x, 0, n - 1)]
+        return (river_mask > 0.5) & valid & (plus > dem + 5) & (minus > dem + 5)
 
     def _advect_2d(self, field: np.ndarray, vx: np.ndarray, vy: np.ndarray, dt: float) -> np.ndarray:
         """Simple semi-Lagrangian advection"""
-        n = field.shape[0]
-        result = np.zeros_like(field)
+        from scipy.ndimage import map_coordinates
 
-        for i in range(n):
-            for j in range(n):
-                # Trace back
-                x_src = j - vx[i, j] * dt / self.engine.cell_size
-                y_src = i - vy[i, j] * dt / self.engine.cell_size
-
-                # Bilinear interpolation
-                x0, y0 = int(np.floor(x_src)), int(np.floor(y_src))
-                x1, y1 = x0 + 1, y0 + 1
-
-                if 0 <= x0 < n-1 and 0 <= y0 < n-1:
-                    fx, fy = x_src - x0, y_src - y0
-                    result[i, j] = (
-                        field[y0, x0] * (1-fx) * (1-fy) +
-                        field[y0, x1] * fx * (1-fy) +
-                        field[y1, x0] * (1-fx) * fy +
-                        field[y1, x1] * fx * fy
-                    )
-                else:
-                    result[i, j] = field[i, j]
-
-        return result
+        yy, xx = np.indices(field.shape, dtype=np.float32)
+        x_src = xx - vx * dt / self.engine.cell_size
+        y_src = yy - vy * dt / self.engine.cell_size
+        # Match the former bilinear interpolation and preserve the field at
+        # cells whose backtrace leaves the grid.
+        inside = ((x_src >= 0) & (x_src < field.shape[1] - 1) &
+                  (y_src >= 0) & (y_src < field.shape[0] - 1))
+        result = map_coordinates(field, [y_src, x_src], order=1, mode="nearest", prefilter=False)
+        return np.where(inside, result, field)
 
     def compute_moon_hazards(self, solar_azimuth_start: float = -90.0,
                               solar_azimuth_end: float = 90.0,

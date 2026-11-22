@@ -159,10 +159,13 @@ class TerrainEngine:
         terrain = (terrain - terrain.min()) / (terrain.max() - terrain.min())
         dem = -3000 + terrain * 4000
 
-        # Ensure PSR (Shackleton floor) is deepest
+        # Keep the Shackleton PSR as a crater basin. The former 500x
+        # exaggeration turned tiny DEM differences into a towering spike,
+        # which distorted both the lunar mesh and route costs.
         shackleton_dist = np.sqrt(X**2 + Y**2)
         psr_mask = shackleton_dist < 0.25
-        dem[psr_mask] = -3000 + (dem[psr_mask] - dem[psr_mask].min()) * 500
+        psr_floor = dem[psr_mask].min()
+        dem[psr_mask] = -3000 + (dem[psr_mask] - psr_floor) * 0.5
 
         self.dem = dem.astype(np.float32)
         self.mode = "moon"

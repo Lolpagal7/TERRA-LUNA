@@ -7,7 +7,7 @@ import type {
   ReceiverState, TerrainPreset
 } from '@/types';
 
-const API_BASE = '/api';
+const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api';
 
 class ApiService {
   private client: AxiosInstance;
@@ -25,8 +25,8 @@ class ApiService {
     this.client.interceptors.response.use((response) => response);
   }
 
-  async simulate(request: SimulateRequest): Promise<SimulateResponse> {
-    const response = await this.client.post<SimulateResponse>('/simulate', request, { timeout: 30000 });
+  async simulate(request: SimulateRequest, signal?: AbortSignal): Promise<SimulateResponse> {
+    const response = await this.client.post<SimulateResponse>('/simulate', request, { timeout: 30000, signal });
     return response.data;
   }
 

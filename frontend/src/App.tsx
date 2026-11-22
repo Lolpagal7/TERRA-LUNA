@@ -7,6 +7,7 @@ import { LeftControlDock } from './components/LeftControlDock';
 import { RightTelemetryDock } from './components/RightTelemetryDock';
 import { useMissionStore } from './store/useMissionStore';
 import { api } from './services/api';
+import { loadLatestMission, saveLatestMission } from './services/firebase';
 
 function App() {
   const {
@@ -17,6 +18,25 @@ function App() {
   const { active: assetsLoading, loaded: assetsLoaded, total: assetsTotal } = useProgress();
   const [startupLoading, setStartupLoading] = useState(true);
   const preparedRequest = useRef('');
+
+  // Restore only the compact mission inputs from Firestore. Terrain rasters
+  // and simulation arrays remain on the API and are recomputed when opened.
+  useEffect(() => {
+    let active = true;
+    void loadLatestMission().then((saved) => {
+      if (!active || !saved) return;
+      const store = useMissionStore.getState();
+      store.setMode(saved.mode);
+      store.setStartWaypoint({ x: saved.start[0], y: saved.start[1] });
+      store.setGoalWaypoint({ x: saved.goal[0], y: saved.goal[1] });
+      store.setEnvIntensity(saved.env_intensity);
+      store.setNoiseLevel(saved.noise_level);
+      store.setNextWaypointTarget('start');
+    }).catch((err) => {
+      console.warn('Could not restore the saved ASTRA mission from Firebase.', err);
+    });
+    return () => { active = false; };
+  }, []);
 
   useEffect(() => {
     const assetsReady = !assetsLoading && (assetsTotal === 0 || assetsLoaded >= assetsTotal);
@@ -62,6 +82,7 @@ function App() {
     preparedRequest.current = key;
 
     let active = true;
+    const controller = new AbortController();
     const timer = window.setTimeout(async () => {
       setIsSimulating(true);
       setError(null);
@@ -72,10 +93,21 @@ function App() {
           goal: [goalWaypoint.x, goalWaypoint.y],
           env_intensity: envIntensity,
           noise_level: noiseLevel,
-        });
-        if (active) useMissionStore.getState().setSimulationData(result);
+        }, controller.signal);
+        if (active) {
+          useMissionStore.getState().setSimulationData(result);
+          void saveLatestMission({
+            mode,
+            start: [startWaypoint.x, startWaypoint.y],
+            goal: [goalWaypoint.x, goalWaypoint.y],
+            env_intensity: envIntensity,
+            noise_level: noiseLevel,
+          }).catch((saveError) => {
+            console.warn('Could not save the latest ASTRA mission to Firebase.', saveError);
+          });
+        }
       } catch (err) {
-        if (active) setError(err instanceof Error ? err.message : 'Live replanning failed');
+        if (active && !controller.signal.aborted) setError(err instanceof Error ? err.message : 'Live replanning failed');
       } finally {
         if (active) setIsSimulating(false);
       }
@@ -83,6 +115,7 @@ function App() {
 
     return () => {
       active = false;
+      controller.abort();
       window.clearTimeout(timer);
     };
   }, [sceneStage, mode, startWaypoint, goalWaypoint, envIntensity, noiseLevel, simulationData, setError, setIsSimulating]);

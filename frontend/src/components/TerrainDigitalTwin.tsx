@@ -467,7 +467,9 @@ const TrajectoryTube: React.FC<TrajectoryTubeProps> = ({
 
     // Create catmull-rom curve
     const points = waypoints.map(w => new THREE.Vector3(w.x, w.y, w.z));
-    const curve = new THREE.CatmullRomCurve3(points);
+    // Centripetal interpolation keeps the rendered rover route close to the
+    // planned waypoints around tight crater turns.
+    const curve = new THREE.CatmullRomCurve3(points, false, 'centripetal');
     curve.closed = false;
 
     // Tube geometry

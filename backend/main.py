@@ -5,9 +5,12 @@ Main API server with all endpoints for 4D Spatio-Temporal Navigation
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from typing import List, Tuple, Optional, Dict, Any
+from functools import wraps
+from pathlib import Path
+from threading import RLock
 import numpy as np
 import time
 import json
@@ -24,10 +27,28 @@ app = FastAPI(
     version="1.0.0"
 )
 
+_simulation_lock = RLock()
+_hazard_cache_key = None
+
+
+def serialized_simulation(endpoint):
+    """Protect singleton terrain/hazard state while keeping CPU work off-loop."""
+    @wraps(endpoint)
+    def wrapped(*args, **kwargs):
+        with _simulation_lock:
+            return endpoint(*args, **kwargs)
+    return wrapped
+
 # CORS for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://astra-gnc.web.app",
+        "https://astra-gnc.firebaseapp.com",
+    ],
+    allow_origin_regex=r"https://astra-gnc(?:--[a-z0-9-]+)?\.web\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -106,6 +127,10 @@ mesh_state = {
 
 @app.get("/")
 async def root():
+    index_file = Path(__file__).resolve().parents[1] / "frontend" / "dist" / "index.html"
+    if index_file.is_file():
+        from fastapi.responses import FileResponse
+        return FileResponse(index_file)
     return {
         "name": "ASTRA-GNC Mission Control API",
         "version": "1.0.0",
@@ -126,11 +151,12 @@ async def health_check():
 
 
 @app.post("/api/simulate", response_model=SimulateResponse)
-async def simulate(request: SimulateRequest):
+@serialized_simulation
+def simulate(request: SimulateRequest, http_response: Response):
     """
     Main simulation endpoint: runs full 4D planning pipeline
     """
-    start_time = time.time()
+    start_time = time.perf_counter()
 
     try:
         # Validate mode
@@ -152,19 +178,28 @@ async def simulate(request: SimulateRequest):
         planner = get_planner()
         dtn = get_dtn_encoder()
 
-        # Generate terrain for mode
+        # Generate terrain once per mode, and reuse the hazard field when only
+        # waypoints/noise change. This keeps live route edits inexpensive.
+        global _hazard_cache_key
         if request.mode == "earth":
             if engine.dem is None or engine.mode != request.mode:
                 engine.generate_earth_terrain()
-            hazards.compute_earth_hazards(rainfall_mm_hr=request.env_intensity)
+            hazard_key = (request.mode, float(request.env_intensity))
+            if hazard_key != _hazard_cache_key or hazards.hazard_masks is None:
+                hazards.compute_earth_hazards(rainfall_mm_hr=request.env_intensity)
+                _hazard_cache_key = hazard_key
         else:
             if engine.dem is None or engine.mode != request.mode:
                 engine.generate_moon_terrain()
-            hazards.compute_moon_hazards(
-                solar_azimuth_start=-90.0,
-                solar_azimuth_end=90.0,
-                solar_elevation=request.env_intensity if request.env_intensity > 0 else 2.0
-            )
+            solar_elevation = request.env_intensity if request.env_intensity > 0 else 2.0
+            hazard_key = (request.mode, float(solar_elevation))
+            if hazard_key != _hazard_cache_key or hazards.hazard_masks is None:
+                hazards.compute_moon_hazards(
+                    solar_azimuth_start=-90.0,
+                    solar_azimuth_end=90.0,
+                    solar_elevation=solar_elevation
+                )
+                _hazard_cache_key = hazard_key
 
         # Plan 4D path
         path_result = planner.plan_4d_path(
@@ -212,6 +247,7 @@ async def simulate(request: SimulateRequest):
             shadow_masks=hazards.shadow_masks.tolist() if hazards.shadow_masks is not None else None
         )
 
+        http_response.headers["X-Processing-Time-Ms"] = f"{(time.perf_counter() - start_time) * 1000:.1f}"
         return response
 
     except HTTPException:
@@ -226,15 +262,16 @@ async def simulate(request: SimulateRequest):
 
 
 @app.post("/api/upload-dem")
-async def upload_dem(file: UploadFile = File(...), mode: str = Form("earth")):
+def upload_dem(file: UploadFile = File(...), mode: str = Form("earth")):
     """
     Upload and process a real GeoTIFF DEM
     """
+    global _hazard_cache_key
     try:
         engine = get_terrain_engine()
 
         # Read file content
-        content = await file.read()
+        content = file.file.read()
 
         # Save to temporary file for rasterio
         import tempfile
@@ -247,9 +284,11 @@ async def upload_dem(file: UploadFile = File(...), mode: str = Form("earth")):
         try:
             if mode not in ("earth", "moon"):
                 raise HTTPException(status_code=400, detail="Mode must be 'earth' or 'moon'")
-            dem = engine.load_geotiff(tmp_path)
-            engine.mode = mode
-            engine.gravity = 9.81 if mode == "earth" else 1.62
+            with _simulation_lock:
+                dem = engine.load_geotiff(tmp_path)
+                engine.mode = mode
+                engine.gravity = 9.81 if mode == "earth" else 1.62
+                _hazard_cache_key = None
         finally:
             os.unlink(tmp_path)
 

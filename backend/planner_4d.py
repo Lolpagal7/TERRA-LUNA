@@ -36,6 +36,26 @@ class Planner4D:
         self.grid_size = GRID_SIZE
         self.cell_size = CELL_SIZE_M
 
+        # Precompute the 8-connected grid topology once. Rebuilding ~130k
+        # Python edge tuples for every Monte Carlo route was a major latency
+        # cost for interactive waypoint updates.
+        n = self.grid_size
+        y, x = np.indices((n, n))
+        rows = []
+        cols = []
+        distances = []
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1),
+                       (1, 1), (1, -1), (-1, 1), (-1, -1)):
+            nx, ny = x + dx, y + dy
+            valid = (nx >= 0) & (nx < n) & (ny >= 0) & (ny < n)
+            rows.append((y[valid] * n + x[valid]).astype(np.int32))
+            cols.append((ny[valid] * n + nx[valid]).astype(np.int32))
+            distance = np.sqrt(dx * dx + dy * dy) * (1.414 if dx and dy else 1.0)
+            distances.append(np.full(np.count_nonzero(valid), distance, dtype=np.float32))
+        self._edge_rows = np.concatenate(rows)
+        self._edge_cols = np.concatenate(cols)
+        self._edge_distances = np.concatenate(distances)
+
     def plan_4d_path(self, start: Tuple[int, int], goal: Tuple[int, int],
                      noise_level: float = 0.1, monte_carlo_samples: int = 25) -> PathResult:
         """
@@ -53,8 +73,9 @@ class Planner4D:
             if self.hazards.hazard_masks is None:
                 self.hazards.compute_moon_hazards()
 
-        # Get traversability cost (static)
-        static_cost = self.engine.get_traversability_cost()
+        # Get traversability cost (static), including cliff penalties shared
+        # by the optimal, comparison, and Monte Carlo routes.
+        static_cost = self._route_static_cost()
 
         # Time-dependent cost: static * (1 + hazard_intensity * penalty)
         hazard_penalty = 50.0  # Heavy penalty for entering hazard
@@ -144,28 +165,15 @@ class Planner4D:
         sx, sy = start
         gx, gy = goal
 
-        # Build graph
         nodes = n * n
-        edges = []
-        weights = []
-
-        for y in range(n):
-            for x in range(n):
-                u = y * n + x
-                for dx, dy in [(1,0), (-1,0), (0,1), (0,-1), (1,1), (1,-1), (-1,1), (-1,-1)]:
-                    nx, ny = x + dx, y + dy
-                    if 0 <= nx < n and 0 <= ny < n:
-                        v = ny * n + nx
-                        dist = np.sqrt(dx*dx + dy*dy) * (1.414 if dx != 0 and dy != 0 else 1.0)
-                        w = dist * cost[ny, nx]
-                        edges.append((u, v))
-                        weights.append(w)
-
-        if not edges:
+        if self._edge_rows.size == 0:
             return [(sx, sy), (gx, gy)]
-
-        rows, columns = zip(*edges)
-        graph = csr_matrix((weights, (rows, columns)), shape=(nodes, nodes))
+        flat_cost = np.asarray(cost, dtype=np.float32).ravel()
+        # Integrate cost along each edge so high-risk cells are charged both
+        # when entering and leaving; this prevents diagonal corner cutting.
+        edge_cost = (flat_cost[self._edge_rows] + flat_cost[self._edge_cols]) * 0.5
+        weights = self._edge_distances * edge_cost
+        graph = csr_matrix((weights, (self._edge_rows, self._edge_cols)), shape=(nodes, nodes))
         dist_matrix, predecessors = dijkstra(graph, indices=sy*n+sx, return_predecessors=True)
 
         # Reconstruct
@@ -182,6 +190,12 @@ class Planner4D:
         path.reverse()
         return path
 
+    def _route_static_cost(self) -> np.ndarray:
+        """Terrain cost with a strong, finite penalty for rover-scale cliffs."""
+        cost = self.engine.get_traversability_cost()
+        cliff_limit = 70.0 if self.engine.mode == "moon" else 78.0
+        return cost * np.where(self.engine.slope >= cliff_limit, 250.0, 1.0)
+
     def _monte_carlo_corridor(self, cost_4d: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int],
                                noise_level: float, samples: int) -> Dict[str, Any]:
         """
@@ -197,7 +211,7 @@ class Planner4D:
         path_costs = []
 
         # Base cost for perturbation
-        base_static_cost = self.engine.get_traversability_cost()
+        base_static_cost = self._route_static_cost()
 
         for i in range(samples):
             # Perturb slope -> perturb traversability cost
@@ -232,12 +246,10 @@ class Planner4D:
 
         # 95% threshold - use 50% for more visible corridor
         threshold = max(1, int(0.5 * len(all_paths)))
-        corridor_cells = []
-        for t in range(NUM_TIME_STEPS):
-            for y in range(self.grid_size):
-                for x in range(self.grid_size):
-                    if corridor_map[t, y, x] >= threshold:
-                        corridor_cells.append((x, y, t))
+        # Extract the confidence corridor in one NumPy pass instead of
+        # scanning every cell in Python for every response.
+        corridor_indices = np.argwhere(corridor_map >= threshold)
+        corridor_cells = [(int(x), int(y), int(t)) for t, y, x in corridor_indices]
 
         # Also compute lateral spread (confidence tube radius)
         tube_radius = []
@@ -258,15 +270,15 @@ class Planner4D:
 
         # Convert corridor cells to flat list of points for frontend
         corridor_points = []
-        for t in range(NUM_TIME_STEPS):
-            for y in range(self.grid_size):
-                for x in range(self.grid_size):
-                    if corridor_map[t, y, x] >= threshold:
-                        x_m = (x - self.grid_size/2) * self.cell_size
-                        y_m = (y - self.grid_size/2) * self.cell_size
-                        z_m = float(self.engine.dem[y, x]) if self.engine.dem is not None else 0.0
-                        z_m += 7.0  # Above path for visibility
-                        corridor_points.append({"x": x_m, "y": y_m, "z": z_m, "t": t})
+        if corridor_indices.size:
+            times, ys, xs = corridor_indices.T
+            elevations = self.engine.dem[ys, xs] if self.engine.dem is not None else np.zeros(xs.shape)
+            corridor_points = [
+                {"x": float((x - self.grid_size / 2) * self.cell_size),
+                 "y": float((y - self.grid_size / 2) * self.cell_size),
+                 "z": float(z + 7.0), "t": int(t)}
+                for x, y, t, z in zip(xs, ys, times, elevations)
+            ]
 
         return {
             "corridor_cells": corridor_cells,
